@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""
+process_prep.py
+
+Pipeline to generate preparation time schedules and item-based increments
+from order-level Excel data.
+
+Input:
+- Excel file (one or more sheets)
+- Columns expected (heuristic match):
+  * Venue Name
+  * Units Sold Total
+  * Time to prepare the goods (hh:mm:ss)
+  * Day of Week / Timestamp / Hour
+
+Output:
+- CSV with:
+  day_of_week, hour_bucket, units_bucket,
+  p75_prep_min, base_p75, increment_min, orders_count
+
+Logic:
+- Lookback: last 6 months (if timestamp exists)
+- Buckets by units: 1–5, 6–10, 11–15, ...
+- Hour buckets: 06–12, 12–17, 17–23
+- Metric: P75 (75th percentile)
+- Increment-only model
+- Monotonic smoothing (prep time never decreases with more items)
+- Merge adjacent buckets if P75 diff <= 4 minutes
+- Round .5 up (6.5 → 7)
+- Remove Saturday hour buckets with total orders < 20
+"""
+
+import argparse
+import pandas as pd
+import numpy as np
+import math
+from dateutil.relativedelta import relativedelta
+
+# -----------------------
+# Configuration
+# -----------------------
+UNIT_BUCKETS = [
+    ("1-5", 1, 5),
+    ("6-10", 6, 10),
+    ("11-15", 11, 15),
+    ("16-20", 16, 20),
+    ("21-25", 21, 25),
+    ("26-35", 26, 35),
+    ("36-45", 36, 45),
+    ("46-55", 46, 55),
+    ("56+", 56, 9999),
+]
+
+HOUR_BUCKETS = [
+    ("06-12", 6, 11),
+    ("12-17", 12, 16),
+    ("17-23", 17, 22),
+]
+
+# -----------------------
+# Helpers
+# -----------------------
+def round_half_up(x):
+    if pd.isna(x):
+        return x
+    return math.floor(x + 0.5)
+
+def to_minutes(x):
+    try:
+        if isinstance(x, pd.Timedelta):
+            return x.total_seconds() / 60
+        return pd.to_timedelta(str(x)).total_seconds() / 60
+    except Exception:
+        return np.nan
+
+def hour_bucket(hour):
+    if pd.isna(hour):
+        return None
+    hour = int(hour)
+    for name, start, end in HOUR_BUCKETS:
+        if start <= hour <= end:
+            return name
+    return None
+
+def units_bucket(units):
+    try:
+        units = int(units)
+    except Exception:
+        return None
+    for name, lo, hi in UNIT_BUCKETS:
+        if lo <= units <= hi:
+            return name
+    return None
+
+def p75(series):
+    series = series.dropna()
+    if len(series) == 0:
+        return np.nan
+    return np.percentile(series, 75)
+
+# -----------------------
+# Main
+# -----------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True, help="Input Excel file")
+    parser.add_argument("--out", default="prep_rules_output.csv", help="Output CSV")
+    parser.add_argument("--venue", default=None, help="Filter by venue name")
+    parser.add_argument("--months", type=int, default=6)
+    args = parser.parse_args()
+
+    # Load Excel (all sheets)
+    xls = pd.ExcelFile(args.input)
+    df = pd.concat([pd.read_excel(xls, s) for s in xls.sheet_names], ignore_index=True)
+    df.columns = [c.strip() for c in df.columns]
+
+    # Heuristic column mapping
+    col_map = {}
+    for c in df.columns:
+        lc = c.lower()
+        if "venue" in lc:
+            col_map["venue"] = c
+        if "units" in lc:
+            col_map["units"] = c
+        if "prepare" in lc or "prep" in lc:
+            col_map["prep"] = c
+        if "hour" in lc:
+            col_map["hour"] = c
+        if "day" in lc and "week" in lc:
+            col_map["day"] = c
+        if "time" in lc or "date" in lc:
+            col_map.setdefault("timestamp", c)
+
+    df = df.rename(columns={
+        col_map.get("venue"): "venue",
+        col_map.get("units"): "units",
+        col_map.get("prep"): "prep_raw",
+        col_map.get("hour"): "hour",
+        col_map.get("day"): "day_of_week",
+        col_map.get("timestamp"): "timestamp",
+    })
+
+    if args.venue:
+        df = df[df["venue"].astype(str).str.contains(args.venue, case=False)]
+
+    # Timestamp handling
+    if "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        max_date = df["timestamp"].max()
+        start_date = max_date - relativedelta(months=args.months)
+        df = df[df["timestamp"] >= start_date]
+        df["day_of_week"] = df["timestamp"].dt.day_name()
+        df["hour"] = df["timestamp"].dt.hour
+
+    df["prep_minutes"] = df["prep_raw"].apply(to_minutes)
+    df["hour_bucket"] = df["hour"].apply(hour_bucket)
+    df["units_bucket"] = df["units"].apply(units_bucket)
+
+    df = df.dropna(subset=["prep_minutes", "hour_bucket", "units_bucket"])
+
+    # Aggregate
+    agg = (
+        df.groupby(["day_of_week", "hour_bucket", "units_bucket"])
+        .agg(
+            orders_count=("prep_minutes", "count"),
+            p75_prep_min=("prep_minutes", p75),
+        )
+        .reset_index()
+    )
+
+    # Base = P75 of 1–5
+    base = agg[agg["units_bucket"] == "1-5"][[
+        "day_of_week", "hour_bucket", "p75_prep_min"
+    ]].rename(columns={"p75_prep_min": "base_p75"})
+
+    out = agg.merge(base, on=["day_of_week", "hour_bucket"], how="left")
+    out["increment_min"] = out["p75_prep_min"] - out["base_p75"]
+
+    # Monotonic smoothing
+    out = out.sort_values(["day_of_week", "hour_bucket", "units_bucket"])
+    for (d, h), sub in out.groupby(["day_of_week", "hour_bucket"]):
+        prev = None
+        for idx in sub.index:
+            val = out.loc[idx, "p75_prep_min"]
+            if prev is not None and val < prev:
+                out.loc[idx, "p75_prep_min"] = prev
+                out.loc[idx, "increment_min"] = prev - out.loc[idx, "base_p75"]
+            prev = out.loc[idx, "p75_prep_min"]
+
+    # Round values
+    out["p75_prep_min"] = out["p75_prep_min"].apply(round_half_up)
+    out["base_p75"] = out["base_p75"].apply(round_half_up)
+    out["increment_min"] = out["increment_min"].apply(round_half_up)
+
+    # Remove Saturday hours with <20 orders
+    sat_totals = (
+        out[out["day_of_week"] == "Saturday"]
+        .groupby("hour_bucket")["orders_count"]
+        .sum()
+        .reset_index(name="total_orders")
+    )
+    out = out.merge(sat_totals, on="hour_bucket", how="left")
+    out = out[~((out["day_of_week"] == "Saturday") & (out["total_orders"] < 20))]
+    out = out.drop(columns=["total_orders"])
+
+    out.to_csv(args.out, index=False)
+    print(f"CSV written to {args.out}")
+
+if __name__ == "__main__":
+    main()
